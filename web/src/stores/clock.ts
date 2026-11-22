@@ -1,19 +1,28 @@
 import { create } from 'zustand';
 
-/** Server clock offset (serverNow - clientNow). Timers never trust the client clock. */
-export const useClock = create<{ offsetMs: number }>(() => ({ offsetMs: 0 }));
+type ClockState = { serverAtMs: number | null; observedAt: number | null };
+
+/** A server-time anchor advanced with the monotonic performance clock. */
+export const useClock = create<ClockState>(() => ({ serverAtMs: null, observedAt: null }));
 
 export const clock = {
   observe(iso: string, rttMs: number) {
     const server = Date.parse(iso);
     if (Number.isNaN(server)) return;
-    const offset = server + rttMs / 2 - Date.now();
-    const prev = useClock.getState().offsetMs;
-    // Server header has 1 s precision noise; smooth it.
-    useClock.setState({ offsetMs: prev === 0 ? offset : Math.round(prev * 0.8 + offset * 0.2) });
+    const observedAt = performance.now();
+    const estimate = server + Math.max(0, rttMs) / 2;
+    const previous = useClock.getState();
+    const previousNow = previous.serverAtMs === null || previous.observedAt === null ? null : previous.serverAtMs + observedAt - previous.observedAt;
+    const serverAtMs = previousNow === null ? estimate : previousNow + (estimate - previousNow) * 0.2;
+    useClock.setState({ serverAtMs, observedAt });
   },
   now() {
-    return Date.now() + useClock.getState().offsetMs;
+    const { serverAtMs, observedAt } = useClock.getState();
+    return serverAtMs === null || observedAt === null ? Date.now() : serverAtMs + performance.now() - observedAt;
+  },
+  isSynchronized(maxAgeMs = Number.POSITIVE_INFINITY) {
+    const observedAt = useClock.getState().observedAt;
+    return observedAt !== null && performance.now() - observedAt < maxAgeMs;
   },
 };
 

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { assertTeachesCourse, authenticate, requireRole, teacherCourseIds } from '../auth';
 import { one, q, tx } from '../db';
 import { conflict, h, invalid, notFound } from '../errors';
+import { audit } from '../services/audit';
 import { referenceFiles } from '../services/grading';
 import { emptyChoice, langSchema, loadQuestionSpec, parseImport, QUESTION_TYPE_LABEL, questionDto, saveQuestionSchema, validateQuestionSemantics, weightsWarning, writeQuestion } from '../services/questions';
 import { ENABLED_LANGS, LANGS } from '../services/languages';
@@ -131,6 +132,47 @@ bankRouter.put(
     const dto = await questionDto(row.id, req.user!.id);
     const w = b.type === 'code' ? weightsWarning(b.points, b.tests) : null;
     res.json({ ...dto, warnings: w ? [w] : [] });
+  }),
+);
+
+bankRouter.delete(
+  '/teacher/questions/:id',
+  h(async (req, res) => {
+    const row = await ownQuestion(req, String(req.params.id));
+    const protectedUse = await one(
+      `SELECT 1 FROM exam_questions eq JOIN exams e ON e.id = eq.exam_id
+       WHERE eq.source_question_id = $1 AND e.status IN ('draft', 'scheduled', 'live', 'grading')
+         AND e.preview_question_id IS NULL
+       LIMIT 1`,
+      [row.id],
+    );
+    if (protectedUse) throw conflict('QUESTION_IN_ACTIVE_EXAM', 'Remove this question from draft exams or finish active exam workflows before deleting it.');
+
+    const activeRun = await one(
+      `SELECT 1 FROM code_runs cr
+       WHERE cr.status IN ('queued', 'running')
+         AND (cr.question_id = $1 OR cr.exam_question_id IN (SELECT id FROM exam_questions WHERE source_question_id = $1))
+       LIMIT 1`,
+      [row.id],
+    );
+    if (activeRun) throw conflict('QUESTION_RUNS_ACTIVE', 'Wait for this question code runs to finish before deleting it.');
+
+    await tx(async (c) => {
+      await q(`DELETE FROM exams WHERE preview_question_id = $1`, [row.id], c);
+      await audit(
+        {
+          actor: req.user!,
+          category: 'settings',
+          action: 'question.deleted',
+          courseId: row.course_id,
+          target: row.title,
+          details: 'Deleted question-bank item; completed exam snapshots and student submissions are retained.',
+        },
+        c,
+      );
+      await q(`DELETE FROM questions WHERE id = $1`, [row.id], c);
+    });
+    res.status(204).end();
   }),
 );
 

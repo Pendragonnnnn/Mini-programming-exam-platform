@@ -105,6 +105,19 @@ export function QuestionEditor() {
   const crumbs = ['Teacher', 'Question bank', draft?.title || 'Question'];
   if (query.isLoading || (query.data && !draft)) return <TeacherShell crumbs={crumbs}><LoadingState label="Loading the question" /></TeacherShell>;
   if (query.error) return <TeacherShell crumbs={crumbs}><ErrorState what="the question" error={query.error} onRetry={() => query.refetch()} /></TeacherShell>;
+  if (draft && draft.type !== 'code') {
+    return (
+      <TeacherShell crumbs={crumbs}>
+        <Banner tone="info">
+          This legacy non-coding question is read-only and cannot be added to new exams. Its saved exam history is preserved.
+        </Banner>
+        <Link className="btn btn-secondary" to={back ? `/teacher/exams/${back}/questions` : '/teacher/questions'}>
+          <Icon name="arrowl" />
+          {back ? 'Back to exam questions' : 'Back to question bank'}
+        </Link>
+      </TeacherShell>
+    );
+  }
   return (
     <TeacherShell crumbs={crumbs} wide>
       <Editor
@@ -415,7 +428,7 @@ function Editor({ dto, draft, setDraft, dirty, back, onSaved, onReload }: { dto:
                   {isCode ? 'Markdown. Describe the task, the requirements, and an example.' : 'Markdown. This is what students read. Code blocks and images links are fine.'}
                 </p>
               </div>
-              <Seg small value={mdMode} onChange={setMdMode} options={[{ value: 'write', label: 'Write' }, { value: 'split', label: 'Split' }, { value: 'preview', label: 'Preview' }]} />
+              <Seg small value={mdMode} onChange={setMdMode} options={[{ value: 'write', label: 'Write' }, { value: 'split', label: 'Split: edit + preview' }, { value: 'preview', label: 'Preview only' }]} />
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: mdMode === 'split' ? 'repeat(auto-fit, minmax(260px, 1fr))' : '1fr', gap: 14 }}>
               {mdMode !== 'preview' && (
@@ -557,10 +570,17 @@ function Editor({ dto, draft, setDraft, dirty, back, onSaved, onReload }: { dto:
               ))}
             </div>
           )}
+          {fileTab === 'reference' && (
+            <div className="hint" style={{ padding: '10px 18px', borderBottom: '1px solid var(--border)' }}>
+              A correct answer used only to validate the tests. It is never sent to students.
+            </div>
+          )}
           {fileTab === 'setup' ? (
             <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 12 }}>
               <p className="hint" style={{ margin: 0 }}>
                 Runs before every <b>call</b> test. Create the object the tests use; bare calls like <span className="mono">deposit(5)</span> are bound to the variable below.
+                <br />
+                Leave it empty for stdio tests. Test setup is teacher-only and is not shown to students.
               </p>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 260 }}>
                 <label className="label" htmlFor="stv">

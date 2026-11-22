@@ -84,7 +84,7 @@ export function LiveMonitor() {
           </div>
           <p className="sub">
             {notStartedYet ? (
-              <>Starts {new Date(e.startsAt).toUTCString().slice(5, 22)} UTC</>
+              <>Starts {new Date(e.startsAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</>
             ) : running ? (
               <>
                 Window closes in <span className="mono tnum" style={{ color: 'var(--text)', fontWeight: 600 }}>{fmtClock(left)}</span>

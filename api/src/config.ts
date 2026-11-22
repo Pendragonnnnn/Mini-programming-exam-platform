@@ -8,16 +8,15 @@ function req(name: string, fallback?: string): string {
 
 const bool = (v: string | undefined, d: boolean) => (v === undefined || v === '' ? d : ['1', 'true', 'yes'].includes(v.toLowerCase()));
 const int = (v: string | undefined, d: number) => (v === undefined || v === '' || Number.isNaN(Number(v)) ? d : Number(v));
+const isRunner = (v: string): v is 'local' | 'judge0' => v === 'local' || v === 'judge0';
 
 const isProd = process.env.NODE_ENV === 'production';
-/** Demo testing mode: needs BOTH DEMO_MODE=true and NODE_ENV=development. Never on in production. */
-const demoRequested = bool(process.env.DEMO_MODE, false);
-const demoMode = demoRequested && process.env.NODE_ENV === 'development';
+const runnerValue = process.env.RUNNER ?? (isProd ? 'judge0' : 'local');
+if (!isRunner(runnerValue)) throw new Error(`Invalid RUNNER "${runnerValue}". Use "local" or "judge0".`);
+if (isProd && runnerValue === 'local') throw new Error('RUNNER=local is not a security sandbox. Production requires RUNNER=judge0.');
 
 export const config = {
   isProd,
-  demoRequested,
-  demoMode,
   port: int(process.env.PORT, 4000),
   databaseUrl: req('DATABASE_URL', 'postgres://aegis:aegis@127.0.0.1:5432/aegis'),
   jwtAccessSecret: req('JWT_ACCESS_SECRET', isProd ? undefined : 'dev-access-secret-change-me'),
@@ -26,7 +25,7 @@ export const config = {
   corsOrigin: process.env.CORS_ORIGIN ?? '',
   appPublicUrl: (process.env.APP_PUBLIC_URL ?? 'http://localhost:5173').replace(/\/$/, ''),
 
-  runner: (process.env.RUNNER ?? 'local') as 'local' | 'judge0',
+  runner: runnerValue,
   judge0Url: process.env.JUDGE0_URL ?? 'http://judge0-server:2358',
   judge0Token: process.env.JUDGE0_AUTH_TOKEN ?? '',
   judge0MultiFileLang: int(process.env.JUDGE0_LANG_MULTIFILE, 89),

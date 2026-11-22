@@ -5,7 +5,6 @@ import { Toasts } from './components/ui';
 import { Login } from './pages/Login';
 import { ResetPassword } from './pages/ResetPassword';
 import { Setup } from './pages/Setup';
-import { DemoBadge } from './components/Demo';
 import { Courses } from './pages/teacher/Courses';
 import { StudentDashboard } from './pages/student/Dashboard';
 import { Lobby } from './pages/student/Lobby';
@@ -105,7 +104,6 @@ export function App() {
         <Route path="/teacher/audit" element={<RequireRole role="teacher"><AuditLog /></RequireRole>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-      <DemoBadge />
       <Toasts />
     </ErrorBoundary>
   );

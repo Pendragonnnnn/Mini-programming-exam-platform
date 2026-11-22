@@ -95,7 +95,7 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
     }
     const row = await one(`SELECT * FROM users WHERE id = $1 AND is_active`, [payload.sub]);
     if (!row) throw unauthorized('FORBIDDEN', 'Please sign in again.');
-    if (row.is_demo && !config.demoMode) throw unauthorized('DEMO_DISABLED', 'Demo mode is turned off. Sign in with a real account.');
+    if (row.is_demo) throw unauthorized('DEMO_DISABLED', 'This demo account is disabled.');
     req.user = toAuthUser(row);
     next();
   } catch (e) {

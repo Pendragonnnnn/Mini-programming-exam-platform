@@ -1,10 +1,11 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useCallback, useState } from 'react';
 import { api } from '../../api/client';
 import { Icon } from '../../components/Icon';
+import { LiveClock } from '../../components/LiveClock';
 import { TeacherShell } from '../../components/Shell';
-import { ago, Banner, EmptyState, ErrorState, LangBadge, LoadingState, useInterval, langList, langLabel } from '../../components/ui';
+import { ago, Banner, EmptyState, ErrorState, LangBadge, LoadingState, toast, useInterval, langList, langLabel } from '../../components/ui';
 import { clock, fmtClock } from '../../stores/clock';
 
 export const STATUS_BADGE: Record<string, [string, string]> = {
@@ -16,8 +17,8 @@ export const STATUS_BADGE: Record<string, [string, string]> = {
   archived: ['badge b-gray', 'Archived'],
 };
 
-function greeting() {
-  const h = new Date().getHours();
+function greeting(now: number) {
+  const h = new Date(now).getHours();
   return h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
 }
 
@@ -37,10 +38,46 @@ export function examActionLink(e: any) {
 export function TeacherDashboard() {
   const loc = useLocation();
   const nav = useNavigate();
+  const qc = useQueryClient();
   const [published, setPublished] = useState<number | null>((loc.state as any)?.published ?? null);
+  const [reopening, setReopening] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
   const [, setTick] = useState(0);
   useInterval(useCallback(() => setTick((t) => t + 1), []), 1000);
-  const { data, isLoading, error, refetch } = useQuery({ queryKey: ['teacher-dashboard'], queryFn: () => api('/teacher/dashboard'), refetchInterval: 15_000 });
+  const { data, isLoading, error, refetch } = useQuery({ queryKey: ['teacher-dashboard'], queryFn: () => api('/teacher/dashboard'), refetchInterval: 5_000, refetchOnWindowFocus: true });
+
+  const reopenExam = async (examId: string) => {
+    if (!window.confirm('Reopen this exam as a draft to edit it? It will be removed from student dashboards until you publish it again.')) return;
+    setReopening(examId);
+    try {
+      await api(`/teacher/exams/${examId}/reopen`, { method: 'POST' });
+      await qc.invalidateQueries();
+      toast.ok('Exam reopened as a draft.');
+      nav(`/teacher/exams/${examId}/details`);
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      setReopening(null);
+    }
+  };
+
+  const deleteExam = async (exam: any) => {
+    if (exam.status === 'live' || deleting) return;
+    const historyWarning = exam.submissions
+      ? ` This permanently removes student sessions, answers, submissions, and grading history (${exam.submissions.submitted} submitted).`
+      : '';
+    if (!window.confirm(`Permanently delete "${exam.title}"? This cannot be undone.${historyWarning}`)) return;
+    setDeleting(exam.examId);
+    try {
+      await api(`/teacher/exams/${exam.examId}`, { method: 'DELETE' });
+      await qc.invalidateQueries({ queryKey: ['teacher-dashboard'] });
+      toast.ok('Exam and its history deleted.');
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      setDeleting(null);
+    }
+  };
 
   if (isLoading) return <TeacherShell crumbs={['Teacher', 'Dashboard']}><LoadingState label="Loading your dashboard" /></TeacherShell>;
   if (error) return <TeacherShell crumbs={['Teacher', 'Dashboard']}><ErrorState what="your dashboard" error={error} onRetry={() => refetch()} /></TeacherShell>;
@@ -77,21 +114,24 @@ export function TeacherDashboard() {
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', justifyContent: 'space-between', gap: 16 }}>
         <div>
           <h1 className="h1">
-            {greeting()}, {data.greetingName}
+            {greeting(clock.now())}, {data.greetingName}
           </h1>
           <p className="sub">
             {data.termName ? `${data.termName} · ` : ''}You have {data.summary.liveExams} exam{data.summary.liveExams === 1 ? '' : 's'} live and {data.summary.toGrade} submission{data.summary.toGrade === 1 ? '' : 's'} waiting for review.
           </p>
         </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-          <Link className="btn btn-secondary" to="/teacher/questions?new=1">
-            <Icon name="plus" />
-            New question
-          </Link>
-          <Link className="btn btn-primary" to="/teacher/exams/new">
-            <Icon name="plus" />
-            Create exam
-          </Link>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 16 }}>
+          <LiveClock />
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+            <Link className="btn btn-secondary" to="/teacher/questions?new=1">
+              <Icon name="plus" />
+              New coding question
+            </Link>
+            <Link className="btn btn-primary" to="/teacher/exams/new">
+              <Icon name="plus" />
+              Create exam
+            </Link>
+          </div>
         </div>
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
@@ -206,9 +246,26 @@ export function TeacherDashboard() {
                           {!e.submissions ? '—' : e.status === 'live' ? `${e.submissions.inProgress} in progress` : `${e.submissions.submitted} / ${e.submissions.assigned}`}
                         </td>
                         <td style={{ textAlign: 'right' }}>
-                          <Link className="btn btn-ghost btn-sm" to={act.to}>
-                            {act.label}
-                          </Link>
+                          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+                            <Link className="btn btn-ghost btn-sm" to={act.to}>
+                              {act.label}
+                            </Link>
+                            {e.canReopen && (
+                              <button type="button" className="btn btn-secondary btn-sm" onClick={() => reopenExam(e.examId)} disabled={reopening === e.examId} title="Available because no student sessions exist">
+                                {reopening === e.examId ? 'Opening…' : 'Edit'}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm"
+                              onClick={() => deleteExam(e)}
+                              disabled={e.status === 'live' || deleting === e.examId || !!deleting}
+                              title={e.status === 'live' ? 'End the live exam before deleting it.' : 'Permanently delete this exam and its history.'}
+                            >
+                              <Icon name="trash" size={14} />
+                              {deleting === e.examId ? 'Deleting…' : 'Delete'}
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );

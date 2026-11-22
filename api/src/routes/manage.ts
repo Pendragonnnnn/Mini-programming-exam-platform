@@ -178,6 +178,12 @@ manageRouter.post(
         link = await createInvite(u.id, c);
       }
       await q(`INSERT INTO course_teachers(course_id, teacher_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [id, u.id], c);
+      await notify([u.id], {
+        type: 'teacher_message',
+        title: `You were added to ${course.code} · ${course.title}`,
+        actorName: me(req).fullName,
+        link: `/teacher/courses/${id}`,
+      }, c);
       await audit({ actor: me(req), category: 'settings', action: 'course.teacher_added', courseId: id, target: `${course.code} · ${course.title}`, details: `Added ${u.full_name} as a teacher` }, c);
       return { u, link };
     });

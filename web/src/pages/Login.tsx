@@ -4,7 +4,6 @@ import { api, ApiError, errorMessage } from '../api/client';
 import { Icon } from '../components/Icon';
 import { ThemeButton } from '../components/Shell';
 import { LANGS, langLabel, Seg } from '../components/ui';
-import { DemoPanel } from '../components/Demo';
 import { useAuthStore } from '../stores/auth';
 
 export function Login() {
@@ -164,7 +163,6 @@ export function Login() {
             Exams open in Safe Exam Browser.
           </p>
         </form>
-        <DemoPanel />
         </div>
       </div>
     </div>

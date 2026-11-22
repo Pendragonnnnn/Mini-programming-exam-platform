@@ -6,7 +6,6 @@ import { config } from '../config';
 import { one, q, tx } from '../db';
 import { bad, conflict, h, HttpError, invalid, unauthorized } from '../errors';
 import { emailEnabled, sendMail } from '../services/mailer';
-import { DEMO_STUDENT, DEMO_TEACHER, ensureDemo, ensureDemoExam } from '../services/demo';
 
 export const authRouter = Router();
 
@@ -20,11 +19,8 @@ authRouter.post(
     const key = b.identifier.toLowerCase();
     const f = failures.get(key);
     if (f && f.n >= 5 && f.until > Date.now()) throw new HttpError(429, 'RATE_LIMITED', 'Too many attempts. Wait a few minutes and try again.', undefined, { retryAfterSec: Math.ceil((f.until - Date.now()) / 1000) });
-    // Demo usernames (demo mode only): demo_teacher maps to the demo teacher's internal email.
-    const ident = config.demoMode && key === DEMO_TEACHER.username ? DEMO_TEACHER.email : b.identifier;
-    if (config.demoMode && (key === DEMO_TEACHER.username || key === DEMO_STUDENT.username)) await ensureDemo();
-    const user = await one(`SELECT * FROM users WHERE (lower(email) = lower($1) OR upper(student_id) = upper($1)) AND is_active`, [ident]);
-    if (user?.is_demo && !config.demoMode) throw new HttpError(401, 'DEMO_DISABLED', 'Demo accounts are turned off on this server.');
+    const user = await one(`SELECT * FROM users WHERE (lower(email) = lower($1) OR upper(student_id) = upper($1)) AND is_active`, [b.identifier]);
+    if (user?.is_demo) throw new HttpError(401, 'DEMO_DISABLED', 'This demo account is disabled.');
     const ok = user && (await bcrypt.compare(b.password, user.password_hash));
     if (!ok) {
       if (user && !user.password_set_at) throw new HttpError(401, 'ACCOUNT_NOT_SET_UP', 'This account is not set up yet. Open the link your teacher sent you, or ask them to send a new one.');
@@ -58,7 +54,7 @@ authRouter.post(
       }
       if (new Date(row.expires_at).getTime() < Date.now()) return null;
       const user = await one(`SELECT * FROM users WHERE id = $1 AND is_active`, [row.user_id], c);
-      if (!user || (user.is_demo && !config.demoMode)) return null;
+      if (!user || user.is_demo) return null;
       await q(`UPDATE refresh_tokens SET revoked_at = now() WHERE id = $1`, [row.id], c);
       return { user, family: row.family_id, oldId: row.id };
     });
@@ -178,33 +174,5 @@ authRouter.post(
     const u = toAuthUser(user);
     await issueRefresh(res, u.id, null, req);
     res.status(201).json({ ...signAccess(u), user: u });
-  }),
-);
-
-// ---------------------------------------------------------------- demo testing mode (development only)
-/** Is demo mode on? The login page shows the demo buttons only when it is. */
-authRouter.get(
-  '/demo',
-  h(async (_req, res) => {
-    res.json(
-      config.demoMode
-        ? { enabled: true, accounts: { student: { username: DEMO_STUDENT.username, password: DEMO_STUDENT.password }, teacher: { username: DEMO_TEACHER.username, password: DEMO_TEACHER.password } } }
-        : { enabled: false },
-    );
-  }),
-);
-
-/** One-click demo sign-in. Returns 404 unless DEMO_MODE=true and NODE_ENV=development. */
-authRouter.post(
-  '/demo',
-  h(async (req, res) => {
-    if (!config.demoMode) throw new HttpError(404, 'NOT_FOUND', 'Not found.');
-    const b = z.object({ role: z.enum(['student', 'teacher']) }).parse(req.body);
-    const d = await ensureDemo();
-    if (b.role === 'student') await ensureDemoExam();
-    const user = await one(`UPDATE users SET last_login_at = now() WHERE id = $1 RETURNING *`, [b.role === 'teacher' ? d.teacherId : d.studentId]);
-    const u = toAuthUser(user);
-    await issueRefresh(res, u.id, null, req);
-    res.json({ ...signAccess(u), user: u });
   }),
 );

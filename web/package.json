@@ -4,8 +4,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "copy:local-runtimes": "clang-wasm-copy-assets public/clang && node scripts/copy-local-runtimes.mjs",
+    "dev": "npm run copy:local-runtimes && vite",
+    "build": "npm run copy:local-runtimes && tsc -b && vite build",
     "typecheck": "tsc -b --noEmit",
     "preview": "vite preview"
   },
@@ -20,7 +21,9 @@
     "@codemirror/view": "^6.43.15",
     "@tanstack/react-query": "^5.108.0",
     "@uiw/react-codemirror": "^4.25.12",
+    "@live-codes/clang-wasm": "0.3.0",
     "idb-keyval": "^6.3.0",
+    "pyodide": "314.0.8",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.1.0",

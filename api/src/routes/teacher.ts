@@ -38,6 +38,7 @@ async function examRows(courseIds: string[], filter: { status?: string[]; course
        (SELECT count(DISTINCT en.student_id)::int FROM exam_classes ec JOIN enrollments en ON en.class_id = ec.class_id WHERE ec.exam_id = e.id) AS assigned,
        (SELECT count(*)::int FROM exam_sessions s WHERE s.exam_id = e.id AND s.status = 'in_progress' AND NOT s.is_preview) AS in_progress,
        (SELECT count(*)::int FROM exam_sessions s WHERE s.exam_id = e.id AND s.status IN ('submitted','auto_submitted','force_submitted') AND NOT s.is_preview) AS submitted,
+       (SELECT count(*)::int FROM exam_sessions s WHERE s.exam_id = e.id AND NOT s.is_preview) AS real_sessions,
        (SELECT array_agg(el.language ORDER BY el.language) FROM exam_languages el WHERE el.exam_id = e.id
           AND (NOT EXISTS (SELECT 1 FROM exam_questions eq WHERE eq.exam_id = e.id AND eq.snapshot ? 'languages')
                OR EXISTS (SELECT 1 FROM exam_questions eq WHERE eq.exam_id = e.id AND COALESCE(eq.snapshot->>'type', 'code') = 'code' AND eq.snapshot->'languages' ? el.language::text))) AS langs
@@ -58,6 +59,7 @@ async function examRows(courseIds: string[], filter: { status?: string[]; course
     status: e.status,
     startsAt: iso(e.starts_at),
     submissions: e.status === 'draft' ? null : { inProgress: e.in_progress, submitted: e.submitted, assigned: e.assigned },
+    canReopen: e.status === 'grading' && e.real_sessions === 0,
     action: action(e.status),
   }));
 }
@@ -151,7 +153,7 @@ teacherRouter.get(
   h(async (req, res) => {
     const rows = await q(
       `SELECT c.*, t.name AS term_name FROM courses c JOIN course_teachers ct ON ct.course_id = c.id JOIN terms t ON t.id = c.term_id
-       WHERE ct.teacher_id = $1 ORDER BY c.code`,
+       WHERE ct.teacher_id = $1 ORDER BY c.code, t.name, c.title`,
       [me(req).id],
     );
     const items = [];
@@ -194,6 +196,7 @@ teacherRouter.get(
 );
 
 const detailsSchema = z.object({
+  courseId: z.string().uuid().optional(),
   title: z.string().trim().min(1, 'Enter an exam title.').max(200),
   shortTitle: z.string().trim().max(60).nullable().optional(),
   examType: z.enum(['quiz', 'midterm', 'final', 'lab', 'practice']),
@@ -250,10 +253,18 @@ teacherRouter.patch(
     const e = await ownExam(req, String(req.params.id));
     assertEditable(e);
     const b = detailsSchema.partial().parse(req.body);
+    if (b.courseId && b.courseId !== e.course_id) {
+      if (e.status !== 'draft') throw invalid('Only draft exams can change course.', { courseId: 'Only draft exams can change course.' });
+      const questions = await one<{ n: number }>(`SELECT count(*)::int AS n FROM exam_questions WHERE exam_id = $1`, [e.id]);
+      if (questions!.n) throw invalid('Remove exam questions before changing course.', { courseId: 'Remove exam questions before changing course.' });
+      await assertTeachesCourse(me(req).id, b.courseId);
+      if (b.classIds?.length) await assertClassesInCourse(b.courseId, b.classIds);
+    } else if (b.classIds) {
+      await assertClassesInCourse(e.course_id, b.classIds);
+    }
     if (b.startsAt && e.status === 'scheduled' && new Date(b.startsAt).getTime() < Date.now()) throw invalid('Pick a start time in the future.', { startsAt: 'Pick a start time in the future.' });
-    if (b.classIds) await assertClassesInCourse(e.course_id, b.classIds);
     await tx(async (c) => {
-      const map: Record<string, string> = { title: 'title', shortTitle: 'short_title', examType: 'exam_type', instructionsMd: 'instructions_md', startsAt: 'starts_at', durationMinutes: 'duration_minutes', lateJoinMinutes: 'late_join_minutes' };
+      const map: Record<string, string> = { courseId: 'course_id', title: 'title', shortTitle: 'short_title', examType: 'exam_type', instructionsMd: 'instructions_md', startsAt: 'starts_at', durationMinutes: 'duration_minutes', lateJoinMinutes: 'late_join_minutes' };
       const sets: string[] = [];
       const vals: unknown[] = [e.id];
       for (const [k, col] of Object.entries(map)) {
@@ -432,8 +443,7 @@ teacherRouter.post(
       );
       const students = people.map((r: any) => r.id);
       if (b.notifyNow) {
-        const when = `${new Date(e.starts_at).toUTCString().slice(0, 22)} UTC`;
-        await notify(students, { type: 'exam_published', title: `${e.title} is scheduled for ${when}`, link: `/student` }, c);
+        await notify(students, { type: 'exam_published', title: `${e.title} is scheduled`, link: `/student` }, c);
         mails = people
           .filter((p: any) => p.email)
           .map((p: any) => ({
@@ -442,7 +452,7 @@ teacherRouter.post(
             title: e.title,
             paragraphs: [
               `Hello ${p.full_name},`,
-              `Your teacher scheduled ${e.title}. It starts at ${when} and lasts ${e.duration_minutes} minutes.`,
+              `Your teacher scheduled ${e.title}. Check your dashboard for its start time in your local timezone. It lasts ${e.duration_minutes} minutes.`,
               `Sign in with your student ID (${p.student_id}) and open the exam from your dashboard. The lobby opens 15 minutes before the start.`,
             ],
             button: { label: 'Open my exams', url: `${config.appPublicUrl}/login` },
@@ -455,6 +465,28 @@ teacherRouter.post(
     sendMailLater(mails);
     const fresh = await one(`SELECT status, published_at FROM exams WHERE id = $1`, [e.id]);
     res.json({ status: fresh.status, publishedAt: iso(fresh.published_at), notifiedCount: out.notifiedCount, emailsQueued: mails.length });
+  }),
+);
+
+teacherRouter.post(
+  '/teacher/exams/:id/reopen',
+  h(async (req, res) => {
+    const e = await ownExam(req, String(req.params.id));
+    if (e.status !== 'grading') throw conflict('EXAM_NOT_EDITABLE', 'Only exams in grading can be reopened.');
+    await tx(async (c) => {
+      const current = await one<{ status: string }>(`SELECT status FROM exams WHERE id = $1 FOR UPDATE`, [e.id], c);
+      if (current?.status !== 'grading') throw conflict('EXAM_NOT_EDITABLE', 'This exam is no longer in grading.');
+      const activity = await one<{ has_sessions: boolean }>(
+        `SELECT EXISTS(SELECT 1 FROM exam_sessions WHERE exam_id = $1 AND NOT is_preview) AS has_sessions`,
+        [e.id],
+        c,
+      );
+      if (activity!.has_sessions) throw conflict('EXAM_HAS_STUDENT_ACTIVITY', 'This exam cannot be edited because students have started it.');
+      await q(`UPDATE exams SET status = 'draft', published_at = NULL, ended_at = NULL, reminder_sent_at = NULL, updated_at = now() WHERE id = $1`, [e.id], c);
+      await q(`UPDATE exam_questions SET snapshotted_at = NULL WHERE exam_id = $1`, [e.id], c);
+      await audit({ actor: me(req), category: 'publish', action: 'exam.reopened', examId: e.id, courseId: e.course_id, target: e.short_title ?? e.title, details: 'Reopened as a draft; no student sessions existed' }, c);
+    });
+    res.json(await examDto(e.id));
   }),
 );
 
@@ -476,8 +508,28 @@ teacherRouter.delete(
   '/teacher/exams/:id',
   h(async (req, res) => {
     const e = await ownExam(req, String(req.params.id));
-    if (e.status !== 'draft') throw conflict('EXAM_NOT_DRAFT', 'Only drafts can be deleted.');
-    await q(`DELETE FROM exams WHERE id = $1`, [e.id]);
+    if (e.status === 'live') throw conflict('EXAM_IN_PROGRESS', 'End the live exam before deleting it.');
+    const activeRun = await one(
+      `SELECT 1 FROM code_runs cr JOIN exam_questions eq ON eq.id = cr.exam_question_id
+       WHERE eq.exam_id = $1 AND cr.status IN ('queued', 'running') LIMIT 1`,
+      [e.id],
+    );
+    if (activeRun) throw conflict('EXAM_RUNS_ACTIVE', 'Wait for the exam code runs to finish before deleting it.');
+    await tx(async (c) => {
+      await audit(
+        {
+          actor: me(req),
+          category: 'settings',
+          action: 'exam.deleted',
+          examId: e.id,
+          courseId: e.course_id,
+          target: e.short_title ?? e.title,
+          details: `Deleted ${e.status} exam and its sessions, answers, submissions, and grading history.`,
+        },
+        c,
+      );
+      await q(`DELETE FROM exams WHERE id = $1`, [e.id], c);
+    });
     res.status(204).end();
   }),
 );

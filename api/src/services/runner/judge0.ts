@@ -14,7 +14,6 @@ const headers = () => ({
   ...(config.judge0Token ? { 'X-Auth-Token': config.judge0Token } : {}),
 });
 
-const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
 const unb64 = (s: string | null | undefined) => (s ? Buffer.from(s, 'base64').toString('utf8') : '');
 
 function buildZip(job: ExecJob): string {

@@ -8,8 +8,7 @@
     "build": "tsc && cp -r src/db/migrations dist/db/",
     "migrate": "tsx src/db/migrate.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/integration.ts && tsx test/features.ts && tsx test/demo.ts",
-    "test-data": "tsx scripts/create-test-data.ts"
+    "test": "tsx test/integration.ts && tsx test/features.ts"
   },
   "keywords": [],
   "author": "",

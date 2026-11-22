@@ -3,14 +3,15 @@ import { useCallback, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../../api/client';
 import { Icon } from '../../components/Icon';
+import { LiveClock } from '../../components/LiveClock';
 import { StudentShell } from '../../components/Shell';
 import { EmptyState, ErrorState, LangBadge, LoadingState, toast, useInterval, langList, LANGS, langLabel } from '../../components/ui';
 import { startSession } from '../../lib/session';
 import { useAuthStore } from '../../stores/auth';
 import { clock, fmtClock } from '../../stores/clock';
 
-function greeting() {
-  const h = new Date().getHours();
+function greeting(now: number) {
+  const h = new Date(now).getHours();
   return h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
 }
 
@@ -20,7 +21,7 @@ export function StudentDashboard() {
   const [query, setQuery] = useState('');
   const [lf, setLf] = useState('all');
   const [, setTick] = useState(0);
-  const { data, isLoading, error, refetch } = useQuery({ queryKey: ['student-dashboard'], queryFn: () => api('/student/dashboard'), refetchInterval: 30_000 });
+  const { data, isLoading, error, refetch } = useQuery({ queryKey: ['student-dashboard'], queryFn: () => api('/student/dashboard'), refetchInterval: 5_000, refetchOnWindowFocus: true });
   useInterval(useCallback(() => setTick((t) => t + 1), []), 1000);
 
   const openPractice = async () => {
@@ -45,10 +46,11 @@ export function StudentDashboard() {
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', justifyContent: 'space-between', gap: 16 }}>
         <div>
           <h1 className="h1">
-            {greeting()}, {user?.fullName.split(' ')[0]}
+            {greeting(clock.now())}, {user?.fullName.split(' ')[0]}
           </h1>
           <p className="sub">{data.upcoming.length ? `You have ${data.upcoming.length} upcoming exam${data.upcoming.length === 1 ? '' : 's'}.` : 'No upcoming exams right now.'}</p>
         </div>
+        <LiveClock />
       </div>
 
       {next && (

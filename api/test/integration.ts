@@ -86,7 +86,11 @@ async function main() {
   await step('health', async () => {
     const r = await alex.get('/api/health');
     assert.equal(r.status, 200);
-    assert.ok(r.headers.get('x-server-time'));
+    const headerTime = Date.parse(r.headers.get('x-server-time') ?? '');
+    const bodyTime = Date.parse(r.data.serverNow);
+    assert.ok(Number.isFinite(headerTime));
+    assert.ok(Number.isFinite(bodyTime));
+    assert.ok(Math.abs(headerTime - bodyTime) < 1000, 'health body and clock header should agree');
   });
   await step('wrong password → 401 INVALID_CREDENTIALS', async () => {
     const r = await new Client().post('/api/auth/login', { identifier: 'S0001', password: 'nope', role: 'student' });
@@ -173,6 +177,9 @@ async function main() {
     const q2 = qByTitle('Banking Account Inheritance Hierarchy');
     assert.equal(q2.templates.java.find((f: any) => f.path === 'InsufficientFundsException.java').readOnly, true);
     assert.equal(q2.sample.expected, '600.0');
+    assert.equal(q2.sampleTests.length, 2, 'all visible tests should be sent to the browser');
+    assert.ok(!JSON.stringify(q2.sampleTests).includes('502.5'), 'hidden sample test leaked');
+    assert.ok(Number.isSafeInteger(q2.limits.memoryLimitMb) && q2.limits.memoryLimitMb > 0, 'browser runtime needs the effective memory limit');
   });
   await step('resume from a second device takes over the session', async () => {
     const other = new Client();
@@ -234,6 +241,26 @@ async function main() {
     assert.equal(res.testsPassed, 1);
     const t = res.tests.find((x: any) => !x.passed);
     assert.match(t.message, /to be thrown, but returned false instead/);
+  });
+  await step('browser-local run accounting saves the answer without queueing server execution', async () => {
+    const q1 = qByTitle('BankAccount Class');
+    const files = Object.fromEntries(q1.templates.python.map((f: any) => [f.path, f.content]));
+    const before = await one<{ n: number }>(`SELECT count(*)::int AS n FROM code_runs WHERE exam_question_id = $1`, [q1.examQuestionId]);
+    const beforeAnswer = await one<{ last_sample_total: number }>(
+      `SELECT last_sample_total FROM session_answers WHERE exam_question_id = $1 AND session_id = (SELECT id FROM exam_sessions WHERE exam_id = $2 AND student_id = (SELECT id FROM users WHERE student_id = 'S0001'))`,
+      [q1.examQuestionId, examId],
+    );
+    const r = await alex.post(`/api/student/exams/${examId}/local-runs`, { examQuestionId: q1.examQuestionId, kind: 'sample_tests', language: 'python', files });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    const after = await one<{ n: number }>(`SELECT count(*)::int AS n FROM code_runs WHERE exam_question_id = $1`, [q1.examQuestionId]);
+    assert.equal(after.n, before.n, 'browser-local runs must not create server execution jobs');
+    const answer = await one<{ run_count: number; started: boolean; last_sample_total: number }>(
+      `SELECT run_count, started, last_sample_total FROM session_answers WHERE exam_question_id = $1 AND session_id = (SELECT id FROM exam_sessions WHERE exam_id = $2 AND student_id = (SELECT id FROM users WHERE student_id = 'S0001'))`,
+      [q1.examQuestionId, examId],
+    );
+    assert.ok(answer.run_count > 0);
+    assert.equal(answer.started, true);
+    assert.equal(answer.last_sample_total, beforeAnswer.last_sample_total, 'browser-reported sample results must not be stored as authoritative scores');
   });
   await step('Run (program): console output and exit code', async () => {
     const q1 = qByTitle('BankAccount Class');
@@ -300,6 +327,11 @@ async function main() {
     assert.equal(row.progress.length, 3);
     assert.ok(r.data.flagLog.length >= 2);
     assert.equal(r.data.stats.assigned, 8);
+  });
+  await step('live exams cannot be deleted', async () => {
+    const r = await teacher.req('DELETE', `/api/teacher/exams/${examId}`);
+    assert.equal(r.status, 409);
+    assert.equal(r.data.error.code, 'EXAM_IN_PROGRESS');
   });
   await step('+10 min for one student updates the deadline seen by heartbeat', async () => {
     const before = await alex.post(`/api/student/exams/${examId}/heartbeat`, { online: true });
@@ -532,7 +564,7 @@ async function main() {
     assert.equal(acc.status, 200, JSON.stringify(acc.data));
     assert.equal(acc.data.items[0].extraMinutes, 30);
   });
-  await step('publish checks → publish → unpublish', async () => {
+  await step('publish → unpublish → reopen a grading exam with no student sessions', async () => {
     const pc = await teacher.get(`/api/teacher/exams/${newExam}/publish-checks`);
     assert.equal(pc.status, 200);
     assert.equal(pc.data.canPublish, true, JSON.stringify(pc.data.checks));
@@ -544,6 +576,15 @@ async function main() {
     assert.equal(again.status, 409);
     const u = await teacher.post(`/api/teacher/exams/${newExam}/unpublish`);
     assert.equal(u.data.status, 'draft');
+    await q(`UPDATE exams SET status = 'grading', ended_at = now() WHERE id = $1`, [newExam]);
+    const row = (await teacher.get('/api/teacher/exams')).data.items.find((x: any) => x.examId === newExam);
+    assert.equal(row.canReopen, true);
+    const reopened = await teacher.post(`/api/teacher/exams/${newExam}/reopen`);
+    assert.equal(reopened.status, 200, JSON.stringify(reopened.data));
+    assert.equal(reopened.data.status, 'draft');
+    const edited = await teacher.patch(`/api/teacher/exams/${newExam}/details`, { title: 'FX101 Quiz 3 edited' });
+    assert.equal(edited.status, 200, JSON.stringify(edited.data));
+    assert.equal(edited.data.details.title, 'FX101 Quiz 3 edited');
   });
   await step('publish blocked when a question has never been validated', async () => {
     const fin = await one(`SELECT id FROM exams WHERE short_title = 'FX Draft'`);
@@ -565,6 +606,27 @@ async function main() {
     if (r.data.liveExam) assert.ok(Array.isArray(r.data.liveExam.languages));
     const bank = await teacher.get('/api/teacher/questions');
     for (const x of bank.data.items) assert.ok(Array.isArray(x.languages));
+  });
+  await step('question deletion protects drafts and preserves completed exam snapshots', async () => {
+    const fx101 = (await teacher.get('/api/teacher/courses')).data.items.find((c: any) => c.code === 'FX101');
+    const created = await teacher.post('/api/teacher/questions', { courseId: fx101.id, type: 'code', language: 'java' });
+    assert.equal(created.status, 201, JSON.stringify(created.data));
+    const linked = await teacher.put(`/api/teacher/exams/${newExam}/questions`, { items: [{ questionId: created.data.id, points: 10 }] });
+    assert.equal(linked.status, 200, JSON.stringify(linked.data));
+    const blocked = await teacher.req('DELETE', `/api/teacher/questions/${created.data.id}`);
+    assert.equal(blocked.status, 409);
+    assert.equal(blocked.data.error.code, 'QUESTION_IN_ACTIVE_EXAM');
+
+    await q(`UPDATE exams SET status = 'completed' WHERE id = $1`, [newExam]);
+    const deletedQuestion = await teacher.req('DELETE', `/api/teacher/questions/${created.data.id}`);
+    assert.equal(deletedQuestion.status, 204);
+    const missing = await teacher.get(`/api/teacher/questions/${created.data.id}`);
+    assert.equal(missing.status, 404);
+    const snapshot = await one(`SELECT source_question_id, snapshot FROM exam_questions WHERE exam_id = $1`, [newExam]);
+    assert.equal(snapshot.source_question_id, null);
+    assert.equal(snapshot.snapshot.title, 'Untitled question');
+    const deletedExam = await teacher.req('DELETE', `/api/teacher/exams/${newExam}`);
+    assert.equal(deletedExam.status, 204);
   });
 
   console.log('Background jobs');

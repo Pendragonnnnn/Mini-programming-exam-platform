@@ -1,10 +1,10 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useMemo, useState } from 'react';
+import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError } from '../../api/client';
 import { Icon } from '../../components/Icon';
 import { TeacherShell } from '../../components/Shell';
-import { Avatar, Banner, DIFF_CLS, DIFF_LABEL, ErrorState, LangBadge, LoadingState, Seg, Switch, toast, QTYPE_LABEL, QTYPES, LANGS, langLabel, langList, EmptyState } from '../../components/ui';
+import { Avatar, Banner, DIFF_CLS, DIFF_LABEL, ErrorState, LangBadge, LoadingState, Seg, Switch, toast, QTYPE_LABEL, LANGS, langLabel, langList, EmptyState } from '../../components/ui';
 
 const STEPS = [
   ['details', 'Details & schedule'],
@@ -52,7 +52,9 @@ function qMeta(x: any) {
 
 export function ExamWizard() {
   const { examId, step: stepParam } = useParams();
+  const nav = useNavigate();
   const step: Step = (examId ? (stepParam as Step) : 'details') ?? 'details';
+  const [previewing, setPreviewing] = useState(false);
   const exam = useQuery({ queryKey: ['exam', examId], queryFn: () => api(`/teacher/exams/${examId}`), enabled: !!examId });
   const courses = useQuery({ queryKey: ['courses'], queryFn: () => api('/teacher/courses') });
   const title = exam.data?.details?.shortTitle || exam.data?.details?.title || 'New exam';
@@ -61,6 +63,18 @@ export function ExamWizard() {
   if (exam.error || courses.error) return <TeacherShell crumbs={crumbs}><ErrorState what="the exam" error={exam.error ?? courses.error} onRetry={() => { exam.refetch(); courses.refetch(); }} /></TeacherShell>;
   const e = exam.data;
   const locked = e && !['draft', 'scheduled'].includes(e.status);
+  const preview = async () => {
+    if (!examId || !e?.questions?.items?.length) return;
+    setPreviewing(true);
+    try {
+      const r = await api(`/teacher/exams/${examId}/preview-session`, { method: 'POST' });
+      nav(r.previewUrl);
+    } catch (error) {
+      toast.error(error);
+    } finally {
+      setPreviewing(false);
+    }
+  };
   return (
     <TeacherShell crumbs={crumbs}>
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', justifyContent: 'space-between', gap: 16 }}>
@@ -68,6 +82,12 @@ export function ExamWizard() {
           <h1 className="h1">{examId ? title : 'Create exam'}</h1>
           <p className="sub">{e ? `${e.course.code} · ${e.status === 'draft' ? 'Draft' : e.status === 'scheduled' ? 'Scheduled' : e.status}` : 'Set up the details, pick questions, set the rules, then publish.'}</p>
         </div>
+        {!!e?.questions?.items?.length && (
+          <button type="button" className="btn btn-secondary" onClick={preview} disabled={previewing}>
+            <Icon name="eye" />
+            {previewing ? 'Opening preview…' : 'Preview as student'}
+          </button>
+        )}
       </div>
       <Stepper examId={examId} step={step} />
       {locked && <Banner tone="info">This exam has started, so its setup is read-only. You can still add accommodations on the Rules step.</Banner>}
@@ -85,23 +105,24 @@ export function ExamWizard() {
 
 // ------------------------------------------------------------------ step 1
 const pad = (n: number) => (n < 10 ? '0' : '') + n;
-function splitUtc(iso: string | null) {
+function splitLocal(iso: string | null) {
   if (!iso) return { date: '', time: '09:00' };
   const d = new Date(iso);
-  return { date: `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`, time: `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}` };
+  return { date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`, time: `${pad(d.getHours())}:${pad(d.getMinutes())}` };
 }
 
 function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; locked: boolean }) {
   const nav = useNavigate();
   const qc = useQueryClient();
   const d = exam?.details;
-  const [courseId, setCourseId] = useState<string>(exam?.course.id ?? courses[0]?.id ?? '');
+  const firstCourseWithClasses = courses.find((c) => c.classes?.length);
+  const [courseId, setCourseId] = useState<string>(exam?.course.id ?? firstCourseWithClasses?.id ?? courses[0]?.id ?? '');
   const [title, setTitle] = useState(d?.title ?? '');
   const [shortTitle, setShortTitle] = useState(d?.shortTitle ?? '');
   const [examType, setExamType] = useState(d?.examType ?? 'midterm');
   const [classIds, setClassIds] = useState<string[]>(d?.classIds ?? []);
   const [instructions, setInstructions] = useState(d?.instructionsMd ?? '');
-  const init = splitUtc(d?.startsAt ?? null);
+  const init = splitLocal(d?.startsAt ?? null);
   const [date, setDate] = useState(init.date);
   const [time, setTime] = useState(init.time);
   const [duration, setDuration] = useState<number>(d?.durationMinutes ?? 90);
@@ -109,19 +130,14 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const course = courses.find((c) => c.id === courseId);
-  const startsAt = date && time ? new Date(`${date}T${time}:00Z`) : null;
+  const startsAt = date && time ? new Date(`${date}T${time}:00`) : null;
   const close = startsAt ? new Date(startsAt.getTime() + (late + duration) * 60_000) : null;
-  const local = startsAt ? new Date(startsAt.getTime() + 7 * 3600_000) : null;
   const students = (course?.classes ?? []).filter((c: any) => classIds.includes(c.id)).reduce((a: number, c: any) => a + c.studentCount, 0);
   const conflicts = useQuery({
     queryKey: ['conflicts', exam?.id, startsAt?.toISOString(), duration, late, classIds.join(',')],
     queryFn: () => api(`/teacher/exams/${exam.id}/schedule-conflicts`, { query: { startsAt: startsAt!.toISOString(), durationMinutes: duration, lateJoinMinutes: late, classIds: classIds.join(',') } }),
     enabled: !!exam?.id && !!startsAt && classIds.length > 0,
   });
-  useEffect(() => {
-    if (!exam && course) setClassIds((ids) => ids.filter((id) => course.classes.some((c: any) => c.id === id)));
-  }, [courseId]); // eslint-disable-line react-hooks/exhaustive-deps
-
   const save = async () => {
     const fe: Record<string, string> = {};
     if (!title.trim()) fe.title = 'Enter an exam title.';
@@ -129,7 +145,7 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
     if (Object.keys(fe).length) return setErrors(fe);
     setErrors({});
     setBusy(true);
-    const body = { title: title.trim(), shortTitle: shortTitle.trim() || null, examType, classIds, instructionsMd: instructions, startsAt: startsAt ? startsAt.toISOString() : null, durationMinutes: duration, lateJoinMinutes: late };
+    const body = { courseId, title: title.trim(), shortTitle: shortTitle.trim() || null, examType, classIds, instructionsMd: instructions, startsAt: startsAt ? startsAt.toISOString() : null, durationMinutes: duration, lateJoinMinutes: late };
     try {
       let id = exam?.id;
       if (!id) {
@@ -176,10 +192,18 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
                   Course <span style={{ color: 'var(--bad)' }}>*</span>
                 </label>
                 <div className="field">
-                  <select id="co" value={courseId} onChange={(e) => setCourseId(e.target.value)} disabled={!!exam}>
+                  <select
+                    id="co"
+                    value={courseId}
+                    onChange={(e) => {
+                      setCourseId(e.target.value);
+                      setClassIds([]);
+                    }}
+                    disabled={!!exam && exam.status !== 'draft'}
+                  >
                     {courses.map((c) => (
                       <option key={c.id} value={c.id}>
-                        {c.code} · {c.title}
+                        {c.code} · {c.title} · {c.termName} ({c.classes.length} classes)
                       </option>
                     ))}
                   </select>
@@ -223,7 +247,14 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
                     </button>
                   );
                 })}
+                {!course?.classes?.length && <span className="hint">This course has no classes yet.</span>}
               </div>
+              {!course?.classes?.length && course && (
+                <Link className="btn btn-ghost btn-sm" to={`/teacher/courses/${course.id}`} style={{ alignSelf: 'flex-start' }}>
+                  <Icon name="users" size={15} />
+                  Manage classes
+                </Link>
+              )}
               <span className="hint">{classIds.length ? `${students} students will receive this exam.` : 'Choose at least one class before publishing.'}</span>
               {fieldErr('classIds')}
             </div>
@@ -247,7 +278,7 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <label className="label" htmlFor="sd">
-                  Start date (UTC) <span style={{ color: 'var(--bad)' }}>*</span>
+                  Start date (your local time) <span style={{ color: 'var(--bad)' }}>*</span>
                 </label>
                 <div className={`field ${errors.startsAt ? 'invalid' : ''}`}>
                   <Icon name="calendar" stroke="var(--muted)" />
@@ -257,21 +288,14 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <label className="label" htmlFor="stt">
-                  Start time (UTC) <span style={{ color: 'var(--bad)' }}>*</span>
+                  Start time (your local time) <span style={{ color: 'var(--bad)' }}>*</span>
                 </label>
                 <div className="field">
                   <Icon name="clock" stroke="var(--muted)" />
                   <input id="stt" type="time" value={time} onChange={(e) => setTime(e.target.value)} disabled={locked} />
                 </div>
               </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <span className="label">Students' local time</span>
-                <div className="field readonly">
-                  <Icon name="globe" stroke="var(--muted)" />
-                  <span className="tnum">{local ? `${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}${local.getUTCDate() !== startsAt!.getUTCDate() ? ' next day' : ''} in Phnom Penh` : '—'}</span>
-                </div>
-                <span className="hint">Phnom Penh (UTC+07:00). Everyone starts at the same moment.</span>
-              </div>
+              <span className="hint" style={{ gridColumn: '1 / -1' }}>Students see the same moment in their own local timezone.</span>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <span className="label">Duration</span>
@@ -303,10 +327,10 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
                 <span className="hint">Lockout closes strictly after this window.</span>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <span className="label">Window closes (UTC)</span>
+                <span className="label">Window closes (your local time)</span>
                 <div className="field readonly">
                   <Icon name="lock" stroke="var(--muted)" />
-                  <span className="tnum">{close ? `${close.toLocaleDateString('en', { month: 'short', day: 'numeric', timeZone: 'UTC' })} · ${pad(close.getUTCHours())}:${pad(close.getUTCMinutes())} UTC` : '—'}</span>
+                  <span className="tnum">{close ? close.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</span>
                 </div>
                 <span className="hint">Start + late window + duration. Updates as you edit.</span>
               </div>
@@ -318,7 +342,7 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
           {[
             ['Course', course?.code ?? '—'],
             ['Classes', `${classIds.length} · ${students} students`],
-            ['Starts', startsAt ? `${startsAt.toLocaleDateString('en', { month: 'short', day: 'numeric', timeZone: 'UTC' })} · ${time} UTC` : '—'],
+            ['Starts', startsAt ? startsAt.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'],
             ['Duration', `${duration} minutes`],
             ['Late join', `${late} min`],
             ['Questions', exam ? `${exam.questions.items.length} · ${exam.questions.totalPoints} pts` : '—'],
@@ -334,7 +358,7 @@ function DetailsStep({ exam, courses, locked }: { exam: any; courses: any[]; loc
             <div key={c.classCode + c.startsAt} style={{ display: 'flex', gap: 10, padding: 12, borderRadius: 10, background: 'var(--warn-bg)', color: 'var(--warn)', fontSize: 13 }}>
               <Icon name="alert" />
               <span>
-                {c.classCode} has a {c.label} that overlaps {new Date(c.startsAt).toISOString().slice(11, 16)}–{new Date(c.endsAt).toISOString().slice(11, 16)} UTC.
+                {c.classCode} has a {c.label} that overlaps {new Date(c.startsAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}–{new Date(c.endsAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}.
               </span>
             </div>
           ))}
@@ -374,8 +398,8 @@ function QuestionsStep({ exam, locked }: { exam: any; locked: boolean }) {
           courseId: exam.course.id,
           q: query,
           difficulty: diff === 'all' ? undefined : diff,
-          language: lang === 'all' || lang.startsWith('type:') ? undefined : lang,
-          type: lang.startsWith('type:') ? lang.slice(5) : lang === 'all' ? undefined : 'code',
+          language: lang === 'all' ? undefined : lang,
+          type: 'code',
           pageSize: 200,
         },
       }),
@@ -509,12 +533,7 @@ function QuestionsStep({ exam, locked }: { exam: any; locked: boolean }) {
               </div>
               <div className="field" style={{ height: 38, padding: '0 10px' }}>
                 <select aria-label="Language" value={lang} onChange={(e) => setLang(e.target.value)} style={{ fontSize: 13 }}>
-                  <option value="all">All types & languages</option>
-                  {QTYPES.filter((t) => t !== 'code').map((t) => (
-                    <option key={t} value={`type:${t}`}>
-                      {QTYPE_LABEL[t]}
-                    </option>
-                  ))}
+                  <option value="all">All coding languages</option>
                   {LANGS.map((l) => (
                     <option key={l} value={l}>
                       Coding · {langLabel(l)}
@@ -695,7 +714,7 @@ function SettingsStep({ exam, locked }: { exam: any; locked: boolean }) {
                 );
               })}
             </div>
-            <span className="hint">Only matters for coding questions. An exam with only multiple choice / short answer questions needs no language.</span>
+            <span className="hint">These limits apply to all coding questions in the exam.</span>
           </section>
           <section className="card" style={{ padding: '8px 24px 12px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '16px 0 6px' }}>
@@ -774,7 +793,8 @@ function SettingsStep({ exam, locked }: { exam: any; locked: boolean }) {
                       <span className="mono hint">{x.studentId}</span>
                     </button>
                   ))}
-                  {students.data?.items?.length === 0 && <div className="hint" style={{ padding: 12 }}>No students found.</div>}
+                  {students.isLoading && <div className="hint" style={{ padding: 12 }}>Searching students…</div>}
+                  {!students.isLoading && students.data?.items?.length === 0 && <div className="hint" style={{ padding: 12 }}>No students found in this course.</div>}
                 </div>
               )}
             </div>
@@ -811,7 +831,6 @@ function ReviewStep({ exam }: { exam: any }) {
   const d = exam.details;
   const s = exam.settings;
   const startsAt = d.startsAt ? new Date(d.startsAt) : null;
-  const localStr = useMemo(() => (startsAt ? new Date(startsAt.getTime() + 7 * 3600_000).toISOString().slice(11, 16) : ''), [startsAt]);
   const publish = async () => {
     setBusy(true);
     try {
@@ -831,14 +850,6 @@ function ReviewStep({ exam }: { exam: any }) {
       await api(`/teacher/exams/${exam.id}/unpublish`, { method: 'POST' });
       qc.invalidateQueries();
       toast.ok('The exam is a draft again.');
-    } catch (e) {
-      toast.error(e);
-    }
-  };
-  const preview = async () => {
-    try {
-      const r = await api(`/teacher/exams/${exam.id}/preview-session`, { method: 'POST' });
-      nav(r.previewUrl);
     } catch (e) {
       toast.error(e);
     }
@@ -869,9 +880,9 @@ function ReviewStep({ exam }: { exam: any }) {
           {card('Details & schedule', 'details', [
             ['Title', d.title],
             ['Classes', `${d.classIds.length} class${d.classIds.length === 1 ? '' : 'es'} · ${d.studentCount} students`],
-            ['Starts', startsAt ? `${startsAt.toUTCString().slice(5, 22)} UTC (${localStr} in Phnom Penh)` : 'Not scheduled'],
+            ['Starts', startsAt ? startsAt.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Not scheduled'],
             ['Duration', `${d.durationMinutes ?? '—'} minutes · late join ${d.lateJoinMinutes} min`],
-            ['Window closes', d.windowClosesAt ? `${new Date(d.windowClosesAt).toISOString().slice(11, 16)} UTC` : '—'],
+            ['Window closes', d.windowClosesAt ? new Date(d.windowClosesAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'],
           ])}
           {card('Questions', 'questions', [
             ...exam.questions.items.map((q: any, i: number) => [`${i + 1}. ${q.title}`, `${q.points} pts · ${q.type && q.type !== 'code' ? QTYPE_LABEL[q.type] : langList(q.languages)}`] as [string, string]),
@@ -919,18 +930,10 @@ function ReviewStep({ exam }: { exam: any }) {
                 {busy ? 'Publishing…' : 'Publish & send to students'}
               </button>
               {checks.data && !checks.data.canPublish && <span className="err-text">Fix the red checks first.</span>}
-              <button type="button" className="btn btn-secondary" onClick={preview} disabled={!exam.questions.items.length}>
-                <Icon name="eye" />
-                Preview as student
-              </button>
             </section>
           )}
           {exam.status === 'scheduled' && (
             <section className="card" style={{ padding: '22px 24px', display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <button type="button" className="btn btn-secondary" onClick={preview}>
-                <Icon name="eye" />
-                Preview as student
-              </button>
               <Link className="btn btn-secondary" to={`/teacher/exams/${exam.id}/monitor`}>
                 <Icon name="pulse" />
                 Open live monitor

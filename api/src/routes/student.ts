@@ -503,7 +503,10 @@ examRouter.get(
         continue;
       }
       const eff = effectiveLangs(spec, langs);
-      const sample = exam.show_sample_tests ? spec.tests.filter((t) => !t.hidden).sort((x, y) => x.sortOrder - y.sortOrder)[0] : undefined;
+      const sampleTests = exam.show_sample_tests
+        ? spec.tests.filter((t) => !t.hidden).sort((x, y) => x.sortOrder - y.sortOrder)
+        : [];
+      const sample = sampleTests[0];
       const templates: Record<string, any> = {};
       for (const l of eff) templates[l] = (spec.files[l]?.starter ?? []).map((f) => ({ path: f.path, readOnly: f.readOnly, content: f.content, isEntrypoint: f.isEntrypoint }));
       questions.push({
@@ -519,6 +522,12 @@ examRouter.get(
         languages: eff,
         options: [],
         sample: sample ? { input: sample.input, expected: sample.expected } : null,
+        sampleTests: sampleTests.map((t) => ({ id: t.id, name: t.name, kind: t.kind, input: t.input, expected: t.expected, matchType: t.matchType, floatTolerance: t.floatTolerance })),
+        sampleSetup: eff.includes('python') && sampleTests.some((t) => t.kind === 'call') ? spec.setup?.python ?? null : null,
+        limits: {
+          timeLimitMs: Math.min(spec.limits.timeLimitMs, exam.time_limit_ms),
+          memoryLimitMb: Math.min(spec.limits.memoryLimitMb, exam.memory_limit_mb),
+        },
         templates,
         answer: { language: eff.includes(a.language) ? a.language : eff[0], files: a.files ?? {}, response: null, revision: a.revision, serverSavedAt: iso(a.server_saved_at) },
         sampleStatus: { passed: a.last_sample_passed, total: a.last_sample_total, started: a.started },
@@ -837,6 +846,67 @@ examRouter.post(
     kick();
     const pos = await one<{ n: number }>(`SELECT count(*)::int AS n FROM code_runs WHERE status = 'queued' AND created_at <= (SELECT created_at FROM code_runs WHERE id = $1)`, [runId]);
     res.status(202).json({ runId, status: 'queued', position: pos!.n });
+  }),
+);
+
+examRouter.post(
+  '/local-runs',
+  h(async (req, res) => {
+    const s = req.examSession!;
+    const { exam } = req.examCtx!;
+    assertWritable(s);
+    const b = z
+      .object({
+        examQuestionId: z.string().uuid(),
+        kind: z.enum(['run', 'sample_tests']),
+        language: langSchema,
+        files: z.record(z.string().max(120), z.string()),
+      })
+      .parse(req.body);
+    if (!['python', 'c', 'cpp'].includes(b.language)) throw invalid('This language does not use browser-local execution.', {});
+    if (b.kind === 'run' && !exam.allow_run) throw forbidden('RUN_DISABLED', 'Running code is turned off for this exam.');
+    if (b.kind === 'sample_tests' && !exam.show_sample_tests) throw forbidden('SAMPLE_TESTS_HIDDEN', 'Sample tests are hidden for this exam.');
+    rateLimit(req.user!.id);
+    const langs = await examLangs(exam.id);
+    const saved = await tx(async (c) => {
+      const a = await one(
+        `SELECT a.*, eq.snapshot FROM session_answers a JOIN exam_questions eq ON eq.id = a.exam_question_id WHERE a.session_id = $1 AND a.exam_question_id = $2`,
+        [s.id, b.examQuestionId],
+        c,
+      );
+      if (!a) throw notFound('NOT_FOUND', 'Question not found in this exam.');
+      if (!isCode(a.snapshot)) throw invalid('Only coding questions can be run.', {});
+      if (!effectiveLangs(a.snapshot as QuestionSpec, langs).includes(b.language)) throw invalid('This language is not allowed for this question.', { language: 'Not allowed' });
+      if (exam.runs_per_question && a.run_count >= exam.runs_per_question) throw new HttpError(429, 'RUN_LIMIT_REACHED', `You have used all ${exam.runs_per_question} runs for this question.`);
+
+      const spec = a.snapshot as QuestionSpec;
+      const edits: FileMap = {};
+      const previous: FileMap = (a.files ?? {})[b.language] ?? {};
+      for (const file of spec.files[b.language]?.starter ?? []) {
+        if (file.readOnly) continue;
+        const content = b.files[file.path];
+        if (content !== undefined && (content !== file.content || previous[file.path] !== undefined)) edits[file.path] = content;
+      }
+      const result = await saveAnswer(
+        c,
+        s,
+        b.examQuestionId,
+        { language: b.language, files: edits, baseRevision: a.revision, clientSavedAt: new Date().toISOString() },
+        langs,
+      );
+      if (b.kind === 'sample_tests') {
+        await q(
+          `UPDATE session_answers SET run_count = run_count + 1, started = true, last_sample_passed = 0, last_sample_total = 0, last_sample_run_id = NULL WHERE id = $1`,
+          [a.id],
+          c,
+        );
+      } else {
+        await q(`UPDATE session_answers SET run_count = run_count + 1, started = true WHERE id = $1`, [a.id], c);
+      }
+      await q(`UPDATE exam_sessions SET last_seen_at = now() WHERE id = $1`, [s.id], c);
+      return result;
+    });
+    res.json({ revision: saved.revision, serverSavedAt: saved.serverSavedAt, merged: saved.merged || undefined });
   }),
 );
 

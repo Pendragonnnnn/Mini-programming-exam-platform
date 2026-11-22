@@ -36,7 +36,8 @@ export function Lobby() {
   const { data, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['lobby', examId, recheck],
     queryFn: () => api(`/student/exams/${examId}/lobby`, { query: { recheck: recheck > 0 ? 1 : undefined } }),
-    refetchInterval: 20_000,
+    refetchInterval: 5_000,
+    refetchOnWindowFocus: true,
   });
   useInterval(useCallback(() => setTick((t) => t + 1), []), 1000);
   useEffect(() => {

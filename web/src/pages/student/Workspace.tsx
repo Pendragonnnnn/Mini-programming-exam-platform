@@ -5,6 +5,7 @@ import { CodeEditor } from '../../components/CodeEditor';
 import { Icon } from '../../components/Icon';
 import { Logo, ThemeButton } from '../../components/Shell';
 import { DIFF_CLS, DIFF_LABEL, ErrorState, langLabel, Markdown, QTYPE_LABEL, Seg, toast, type Lang } from '../../components/ui';
+import { executeLocally, type LocalLanguage } from '../../lib/localRunner';
 import { clearLocal, enqueue, getLocal, outbox, putLocal, removeOutbox } from '../../lib/offline';
 import { clearToken, ensureSession } from '../../lib/session';
 import { useAuthStore } from '../../stores/auth';
@@ -13,6 +14,7 @@ import { clock, fmtClock } from '../../stores/clock';
 type Response = { selected?: string[]; text?: string };
 type Files = Record<string, string>;
 const FINAL = new Set(['completed', 'compile_error', 'runtime_error', 'time_limit', 'memory_limit', 'internal_error']);
+const isLocalLanguage = (language: Lang): language is LocalLanguage => language === 'python' || language === 'c' || language === 'cpp';
 
 export function Workspace() {
   const { examId = '' } = useParams();
@@ -28,8 +30,7 @@ export function Workspace() {
   const [results, setResults] = useState<Record<string, any>>({});
   const [consoleRun, setConsoleRun] = useState<Record<string, any>>({});
   const [sample, setSample] = useState<Record<string, { passed: number; total: number; started: boolean }>>({});
-  const [bottom, setBottom] = useState<'t' | 'c' | 'i'>('t');
-  const [stdin, setStdin] = useState('');
+  const [bottom, setBottom] = useState<'t' | 'c'>('t');
   const [running, setRunning] = useState<string | null>(null);
   const [deadline, setDeadline] = useState<string | null>(null);
   const [online, setOnline] = useState(true);
@@ -452,30 +453,76 @@ export function Workspace() {
     flush();
   };
 
-  const run = async (kind: 'run' | 'custom_input' | 'sample_tests') => {
+  const run = async (kind: 'run' | 'sample_tests') => {
     if (!question || running) return;
     if (!onlineRef.current) return toast.warn("You're offline. Running code needs a connection; your code is still saved on this device.");
     setRunning(kind);
-    setBottom(kind === 'sample_tests' ? 't' : kind === 'run' ? 'c' : 'i');
+    setBottom(kind === 'sample_tests' ? 't' : 'c');
     try {
-      const r = await api(`/student/exams/${examId}/runs`, { method: 'POST', examSession: token.current, body: { examQuestionId: qid, kind, language: lang, files: fullFiles(question, lang), stdin: kind === 'custom_input' ? stdin : null } });
-      delete dirty.current[qid];
-      let res: any;
-      for (let i = 0; i < 30; i++) {
-        res = await api(`/student/exams/${examId}/runs/${r.runId}`, { examSession: token.current, query: { waitMs: 10000 } });
-        if (FINAL.has(res.status)) break;
-      }
-      if (kind === 'sample_tests') {
-        setResults((x) => ({ ...x, [qid]: res }));
-        setSample((x) => ({ ...x, [qid]: { passed: res.testsPassed, total: res.testsTotal, started: true } }));
-        if (res.status === 'compile_error') setConsoleRun((x) => ({ ...x, [qid]: res }));
+      const files = fullFiles(question, lang);
+      if (isLocalLanguage(lang)) {
+        const recorded = await api(`/student/exams/${examId}/local-runs`, {
+          method: 'POST',
+          examSession: token.current,
+          body: { examQuestionId: qid, kind, language: lang, files },
+        });
+        revisions.current[qid] = Math.max(revisions.current[qid] ?? 0, recorded.revision);
+        const entrypoint = (question.templates?.[lang] ?? []).find((template: any) => template.isEntrypoint)?.path ?? null;
+        const res = await executeLocally({
+          language: lang,
+          kind,
+          files,
+          entrypoint,
+          tests: kind === 'sample_tests' ? question.sampleTests ?? [] : [],
+          setup: question.sampleSetup ?? null,
+          timeLimitMs: question.limits?.timeLimitMs ?? 5000,
+          memoryLimitMb: question.limits?.memoryLimitMb ?? 128,
+        });
+        if (kind === 'sample_tests') {
+          setResults((x) => ({ ...x, [qid]: res }));
+          setSample((x) => ({ ...x, [qid]: { passed: res.testsPassed, total: res.testsTotal, started: true } }));
+          if (res.status === 'compile_error') setConsoleRun((x) => ({ ...x, [qid]: res }));
+        } else {
+          setConsoleRun((x) => ({ ...x, [qid]: res }));
+        }
+        setSaveState({ saving: false, at: Date.now() });
       } else {
-        setConsoleRun((x) => ({ ...x, [qid]: res }));
+        const r = await api(`/student/exams/${examId}/runs`, { method: 'POST', examSession: token.current, body: { examQuestionId: qid, kind, language: lang, files } });
+        delete dirty.current[qid];
+        let res: any;
+        for (let i = 0; i < 30; i++) {
+          res = await api(`/student/exams/${examId}/runs/${r.runId}`, { examSession: token.current, query: { waitMs: 10000 } });
+          if (FINAL.has(res.status)) break;
+        }
+        if (kind === 'sample_tests') {
+          setResults((x) => ({ ...x, [qid]: res }));
+          setSample((x) => ({ ...x, [qid]: { passed: res.testsPassed, total: res.testsTotal, started: true } }));
+          if (res.status === 'compile_error') setConsoleRun((x) => ({ ...x, [qid]: res }));
+        } else {
+          setConsoleRun((x) => ({ ...x, [qid]: res }));
+        }
+        setSaveState({ saving: false, at: Date.now() });
       }
-      setSaveState({ saving: false, at: Date.now() });
     } catch (e) {
       if (handleApiError(e)) return;
       if (e instanceof NetworkError) goOffline();
+      if (isLocalLanguage(lang)) {
+        const message = e instanceof Error ? e.message : String(e);
+        const failure = {
+          status: 'internal_error',
+          stdout: '',
+          stderr: message,
+          exitCode: null,
+          timeMs: null,
+          tests: kind === 'sample_tests' ? (question.sampleTests ?? []).map((test: any) => ({ name: test.name, passed: false, outcome: 'error', timeMs: null, message: 'Local runner failed.' })) : [],
+          testsPassed: 0,
+          testsTotal: kind === 'sample_tests' ? (question.sampleTests ?? []).length : 0,
+          diagnostics: [],
+          console: [{ stream: 'stderr', text: message }],
+        };
+        setConsoleRun((x) => ({ ...x, [qid]: failure }));
+        if (kind === 'sample_tests') setResults((x) => ({ ...x, [qid]: failure }));
+      }
       toast.error(e);
     } finally {
       setRunning(null);
@@ -702,10 +749,10 @@ export function Workspace() {
             </div>
             <div style={{ flex: 'none', borderTop: '1px solid var(--ed-border)', background: 'var(--ed-panel)' }}>
               <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '6px 12px', borderBottom: '1px solid var(--ed-border)' }}>
-                <Seg value={bottom} onChange={setBottom} small options={[{ value: 't', label: `Tests · ${res ? `${res.testsPassed}/${res.testsTotal}` : '–'}` }, { value: 'c', label: 'Console' }, { value: 'i', label: 'Custom input' }]} />
+                <Seg value={bottom} onChange={setBottom} small options={[{ value: 't', label: `Tests · ${res ? `${res.testsPassed}/${res.testsTotal}` : '–'}` }, { value: 'c', label: 'Console' }]} />
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <span className="hint" aria-live="polite">
-                    {running ? 'Running…' : 'Sample tests only · hidden tests run on submit'}
+                    {running ? 'Running…' : isLocalLanguage(lang) ? 'Python, C and C++ run locally · hidden tests run on submit' : 'Sample tests only · hidden tests run on submit'}
                   </span>
                   {ws.exam.allowRun && (
                     <button type="button" className="btn btn-secondary btn-sm" onClick={() => run('run')} disabled={!!running}>
@@ -729,31 +776,8 @@ export function Workspace() {
                   </div>
                 ) : bottom === 't' ? (
                   <TestsPanel res={res} />
-                ) : bottom === 'c' ? (
-                  <ConsolePanel run={con} />
                 ) : (
-                  <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                    <div style={{ flex: '1 1 240px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-                      <label className="over" htmlFor="stdin" style={{ fontSize: 10.5 }}>
-                        STDIN · given to your program's entry point
-                      </label>
-                      <div className="field area" style={{ padding: '8px 10px' }}>
-                        <textarea id="stdin" className="mono" rows={5} value={stdin} onChange={(e) => setStdin(e.target.value)} style={{ fontSize: 12.5 }} />
-                      </div>
-                      <button type="button" className="btn btn-secondary btn-sm" style={{ alignSelf: 'flex-start' }} onClick={() => run('custom_input')} disabled={!ws.exam.allowRun}>
-                        <Icon name="play" size={13} />
-                        Run with this input
-                      </button>
-                    </div>
-                    <div style={{ flex: '1 1 240px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-                      <span className="over" style={{ fontSize: 10.5 }}>
-                        Output
-                      </span>
-                      <div className="mono ed" style={{ minHeight: 128, padding: '10px 12px', borderRadius: 10, border: '1px solid var(--ed-border)', fontSize: 12.5, lineHeight: 1.8 }}>
-                        {con?.kind === 'custom_input' ? <ConsoleLines run={con} /> : <span style={{ color: 'var(--muted)' }}>Press “Run with this input” to see output</span>}
-                      </div>
-                    </div>
-                  </div>
+                  <ConsolePanel run={con} />
                 )}
               </div>
             </div>

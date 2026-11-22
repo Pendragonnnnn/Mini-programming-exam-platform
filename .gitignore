@@ -1,4 +1,7 @@
 node_modules/
 dist/
+/web/public/clang/
+/web/public/pyodide/
+/web/public/licenses/
 *.tsbuildinfo
 .env
